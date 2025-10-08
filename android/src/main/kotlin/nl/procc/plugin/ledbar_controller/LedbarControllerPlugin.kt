@@ -5,6 +5,7 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import com.example.elcapi.jnielc
+import java.io.FileOutputStream  // 👈 gerekli
 
 class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
@@ -20,114 +21,69 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         channel.setMethodCallHandler(null)
     }
 
-    /* --- Yardımcılar --- */
+    /* -------------------- Helpers (minimal) -------------------- */
 
-    // Sağ için tek-kanal flag (A1/A2/A3). Sol şerit cihazında mono-red olduğu için,
-    // sol flag'i direkt B1 (kırmızı) olarak ele alıyoruz (aşağıda ayrıca kontrol ediyoruz).
-    private fun primaryRight(color: String): Int = when (color) {
-        "red" -> 0xA1
-        "green" -> 0xA2
-        "blue" -> 0xA3
-        else -> 0xA3 // default blue
-    }
+    private fun to015(rawScale: Boolean, v: Int): Int =
+        if (rawScale) v.coerceIn(0, 15) else (v.coerceIn(0, 100) * 15 / 100).coerceIn(0, 15)
 
-    // Kombineleri en yakın tek renge indir (cihaz presetleri güvenilmez)
-    private fun normalizeToPrimary(color: String): String = when (color) {
-        "yellow"  -> "red"    // R+G → R
-        "cyan"    -> "green"  // G+B → G
-        "magenta" -> "blue"   // R+B → B (istersen "red" de seçilebilir)
-        "white"   -> "blue"   // R+G+B → B (görünürlük açısından)
-        else      -> color
-    }
-
-    // Sol taraf (mono-red): yalnız kırmızı içeren renklerde yanmalı
-    private fun leftWantsRed(color: String): Boolean = when (color) {
-        "red", "yellow", "magenta", "white" -> true
-        else -> false // green/blue/cyan için sol sönük
-    }
-
-    // Tek oturumda: önce global temizle (blink kontrollü) → sonra hedef flag(ler)i yaz
-    private fun writeBothOnce(
-        rightFlagOrNull: Int?,       // null ise sağ yazma
-        leftRedOn: Boolean,          // sol şerit yanacak mı?
-        value0_15: Int               // 0..15
-    ) {
-        // 1) temiz başlangıç (rawSeek akışıyla aynı)
-        jnielc.seekstart()
-        jnielc.ledoff()
-        jnielc.seekstop()
-        try { Thread.sleep(50) } catch (_: Throwable) {}
-
-        // 2) tek oturumda hedef(ler)i yaz
-        jnielc.seekstart()
-        if (rightFlagOrNull != null) {
-            jnielc.ledseek(rightFlagOrNull, value0_15)
+    /** Sysfs fallback: doğrudan dosyaya yaz (newline şart) */
+    private fun writeSysfsColor(r255: Int, g255: Int, b255: Int) {
+        val rr = r255.coerceIn(0, 255)
+        val gg = g255.coerceIn(0, 255)
+        val bb = b255.coerceIn(0, 255)
+        val line = String.format("w 0x66%02x%02x%02x\n", rr, gg, bb) // \n önemli
+        val path = "/sys/devices/platform/led_con_h/zigbee_reset"
+        try {
+            FileOutputStream(path).use { fos ->
+                fos.write(line.toByteArray(Charsets.US_ASCII))
+                fos.flush()
+            }
+            Log.i("LED_PLUGIN", "sysfs write OK -> $line")
+        } catch (t: Throwable) {
+            Log.e("LED_PLUGIN", "sysfs write FAIL -> $line at $path", t)
         }
-        if (leftRedOn) {
-            jnielc.ledseek(0xB1, value0_15) // sol: yalnız kırmızı
-        }
-        jnielc.seekstop()
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
             when (call.method) {
 
-                /* ping: hızlı sağlık kontrolü */
                 "ping" -> {
                     result.success("pong")
                 }
 
-                /* rawSeek: geliştirici testi (tek flag) */
-                "rawSeek" -> {
-                    val flag     = call.argument<Int>("flag") ?: 0xA3
-                    val inBright = (call.argument<Int>("brightness") ?: 50).coerceIn(0,100)
-                    val value0_15 = (inBright * 15 / 100).coerceIn(0,15)
-
-                    jnielc.seekstart(); jnielc.ledoff(); jnielc.seekstop()
-                    try { Thread.sleep(50) } catch (_: Throwable) {}
-                    jnielc.seekstart(); jnielc.ledseek(flag, value0_15); jnielc.seekstop()
-                    result.success(null)
-                }
-
-                /* off: tamamen kapat */
                 "off" -> {
-                    jnielc.seekstart(); jnielc.ledoff(); jnielc.seekstop()
+                    try {
+                        jnielc.seekstart()
+                        jnielc.ledoff()
+                        jnielc.seekstop()
+                    } catch (t: Throwable) {
+                        Log.w("LED_PLUGIN", "JNI off failed, fallback to sysfs", t)
+                    }
+                    writeSysfsColor(0, 0, 0)
                     result.success(null)
                 }
 
-                /* setColor: rawSeek akışı ile birebir; kombineleri normalize eder */
-                "setColor" -> {
-                    val colorIn  = (call.argument<String>("color") ?: "blue").lowercase()
-                    val side     = (call.argument<String>("side")  ?: "right").lowercase() // right|left|both
-                    val rawScale = call.argument<Boolean>("rawScale") ?: false
-                    val inB      = call.argument<Int>("brightness") ?: 50
+                "rawSeek" -> {
+                    val flag = call.argument<Int>("flag") ?: 0xA3
+                    val inBright = (call.argument<Int>("brightness") ?: 50).coerceIn(0, 100)
+                    val v015 = to015(false, inBright)
 
-                    // parlaklık: rawScale=true ise 0..15 clamp; değilse 0..100 → 0..15 map
-                    val value0_15 = if (rawScale)
-                        inB.coerceIn(0, 15)
-                    else
-                        (inB.coerceIn(0,100) * 15 / 100).coerceIn(0,15)
-
-                    // kombineleri en yakın tek renge indir
-                    val color = normalizeToPrimary(colorIn)
-
-                    // sağ/sol hedefleri hesapla
-                    val rightFlag: Int? = when (side) {
-                        "right" -> primaryRight(color)
-                        "left"  -> null
-                        "both"  -> primaryRight(color)
-                        else    -> primaryRight(color)
+                    // 1) JNI dene
+                    try {
+                        jnielc.seekstart()
+                        jnielc.ledseek(flag, v015)
+                        jnielc.seekstop()
+                    } catch (t: Throwable) {
+                        Log.w("LED_PLUGIN", "JNI rawSeek failed, fallback to sysfs", t)
                     }
-                    val leftOn = when (side) {
-                        "right" -> false
-                        "left"  -> leftWantsRed(color)
-                        "both"  -> leftWantsRed(color)
-                        else    -> false
+                    // 2) sysfs fallback (flag'a göre yaklaşık RGB)
+                    val (r100,g100,b100) = when (flag) {
+                        0xA1, 0xB1 -> Triple(inBright, 0, 0)     // red
+                        0xA2, 0xB2 -> Triple(0, inBright, 0)     // green
+                        else      -> Triple(0, 0, inBright)      // blue
                     }
-
-                    // tek-oturum yaz
-                    writeBothOnce(rightFlag, leftOn, value0_15)
+                    writeSysfsColor((r100*255)/100, (g100*255)/100, (b100*255)/100)
                     result.success(null)
                 }
 
@@ -138,33 +94,72 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     val inG      = call.argument<Int>("g") ?: 0
                     val inB      = call.argument<Int>("b") ?: 0
 
-                    // driver için 0..15 değere çevir
-                    fun to015(x: Int) = if (rawScale) x.coerceIn(0,15) else (x.coerceIn(0,100) * 15 / 100).coerceIn(0,15)
-                    val R = to015(inR); val G = to015(inG); val BL = to015(inB)
+                    val R015 = to015(rawScale, inR)
+                    val G015 = to015(rawScale, inG)
+                    val B015 = to015(rawScale, inB)
 
+                    // 1) JNI dene
                     try {
-                        // BLINK OLMASIN: doğrudan kanallara yaz
                         jnielc.seekstart()
-
-                        // RIGHT (A1/A2/A3)
                         if (side == "right" || side == "both") {
-                            jnielc.ledseek(0xA1, R)   // red
-                            jnielc.ledseek(0xA2, G)   // green
-                            jnielc.ledseek(0xA3, BL)  // blue
+                            jnielc.ledseek(0xA1, R015)
+                            jnielc.ledseek(0xA2, G015)
+                            jnielc.ledseek(0xA3, B015)
                         }
-
-                        // LEFT: cihazında mono-red → sadece B1 anlamlı (kırmızı); B2/B3 yoksa 0 yazmaya gerek yok
-                        if (side == "left"  || side == "both") {
-                            // Eğer sol RGB destekliyorsa burayı B1/B2/B3 ile açarız; senin cihazda mono-red:
-                            jnielc.ledseek(0xB1, R)   // kırmızı bileşen varsa yanar, yoksa 0
+                        if (side == "left" || side == "both") {
+                            // sol: mono-red
+                            jnielc.ledseek(0xB1, R015)
                         }
-
                         jnielc.seekstop()
-                        result.success(null)
                     } catch (t: Throwable) {
-                        Log.e("LED_PLUGIN", "setRgb error", t)
-                        result.error("LED_ERROR", t.message, null)
+                        Log.w("LED_PLUGIN", "JNI setRgb failed, fallback to sysfs", t)
                     }
+
+                    // 2) sysfs fallback (tek atışta RGB)
+                    writeSysfsColor(
+                        (inR.coerceIn(0, 100) * 255) / 100,
+                        (inG.coerceIn(0, 100) * 255) / 100,
+                        (inB.coerceIn(0, 100) * 255) / 100
+                    )
+                    result.success(null)
+                }
+
+                "setColor" -> {
+                    // Geriye dönük uyumluluk: primary + kombineleri setRgb'e map’ler
+                    val color = (call.argument<String>("color") ?: "blue").lowercase()
+                    val side  = (call.argument<String>("side")  ?: "right").lowercase()
+                    val bright = (call.argument<Int>("brightness") ?: 50).coerceIn(0,100)
+
+                    val (r,g,b) = when (color) {
+                        "red"     -> Triple(bright, 0, bright - bright)   // (bright,0,0)
+                        "green"   -> Triple(0, bright, 0)
+                        "blue"    -> Triple(0, 0, bright)
+                        "yellow"  -> Triple(bright, bright, 0)
+                        "cyan"    -> Triple(0, bright, bright)
+                        "magenta" -> Triple(bright, 0, bright)
+                        "white"   -> Triple(bright, bright, bright)
+                        else      -> Triple(0, 0, bright)
+                    }
+
+                    // JNI dene
+                    try {
+                        jnielc.seekstart()
+                        if (side == "right" || side == "both") {
+                            jnielc.ledseek(0xA1, to015(false, r))
+                            jnielc.ledseek(0xA2, to015(false, g))
+                            jnielc.ledseek(0xA3, to015(false, b))
+                        }
+                        if (side == "left" || side == "both") {
+                            jnielc.ledseek(0xB1, to015(false, r)) // sol: sadece kırmızı
+                        }
+                        jnielc.seekstop()
+                    } catch (t: Throwable) {
+                        Log.w("LED_PLUGIN", "JNI setColor failed, fallback to sysfs", t)
+                    }
+
+                    // sysfs fallback
+                    writeSysfsColor((r*255)/100, (g*255)/100, (b*255)/100)
+                    result.success(null)
                 }
 
                 else -> result.notImplemented()
