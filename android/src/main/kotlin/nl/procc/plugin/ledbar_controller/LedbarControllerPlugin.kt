@@ -118,14 +118,14 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
      * @param sysfsCommand Sysfs'e yazılacak komut (örn: "w 0x66FF0000")
      */
     private fun writeLed(jniBlock: (() -> Unit)?, sysfsCommand: String) {
-        // 1) JNI
-        if (jniBlock != null && tryJni(jniBlock)) return
+        // 1) su 0 ile sysfs (B3PNR 10" için)
+        if (trySysfsSu(sysfsCommand)) return
 
-        // 2) FileOutputStream (doğrudan yazma)
+        // 2) FileOutputStream ile doğrudan sysfs
         if (trySysfsDirect(sysfsCommand)) return
 
-        // 3) su 0 (root shell)
-        if (trySysfsSu(sysfsCommand)) return
+        // 3) JNI (B1PNR / B3PNR 16" için)
+        if (jniBlock != null && tryJni(jniBlock)) return
 
         Log.e(TAG, "All backends failed for command: $sysfsCommand")
     }
