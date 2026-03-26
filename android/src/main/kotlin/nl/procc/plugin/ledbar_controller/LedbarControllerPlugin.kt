@@ -18,6 +18,18 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     /** İlk başarılı çağrıda tespit edilen backend; sonraki çağrılarda cache'den okunur. */
     private var detectedBackend: LedBackend = LedBackend.UNKNOWN
 
+    /** Son gönderilen sysfs komutu — aynı komutu tekrar göndermemek için */
+    private var lastSysfsCommand: String? = null
+
+    /** Son LED yazma zamanı (ms) */
+    private var lastWriteTime: Long = 0L
+
+    /** LED komutları arası minimum bekleme süresi (ms) */
+    private val LED_COOLDOWN_MS = 80L
+
+    /** Eş zamanlı LED erişimini önlemek için kilit */
+    private val ledLock = Object()
+
     companion object {
         private const val TAG = "LED_PLUGIN"
         private const val SYSFS_PATH = "/sys/devices/platform/led_con_h/zigbee_reset"
@@ -38,12 +50,16 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private fun to015(rawScale: Boolean, v: Int): Int =
         if (rawScale) v.coerceIn(0, 15) else (v.coerceIn(0, 100) * 15 / 100).coerceIn(0, 15)
 
+    /** LED kontrolcünün hazır olmasını bekle */
+    private fun waitForCooldown() {
+        val elapsed = System.currentTimeMillis() - lastWriteTime
+        if (elapsed < LED_COOLDOWN_MS) {
+            Thread.sleep(LED_COOLDOWN_MS - elapsed)
+        }
+    }
+
     /* -------------------- Backend: JNI -------------------- */
 
-    /**
-     * seekstart() dönüş değerini kontrol eder.
-     * fp=-1 dönerse JNI kullanılamaz (exception fırlatmaz, sadece log yazar).
-     */
     private fun jniSeekStartOrThrow() {
         val fp = jnielc.seekstart()
         if (fp < 0) throw RuntimeException("JNI seekstart failed: fp=$fp")
@@ -57,6 +73,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 detectedBackend = LedBackend.JNI
                 Log.i(TAG, "Backend detected: JNI")
             }
+            lastWriteTime = System.currentTimeMillis()
             true
         } catch (t: Throwable) {
             Log.w(TAG, "JNI failed: ${t.message}")
@@ -77,6 +94,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 detectedBackend = LedBackend.SYSFS_DIRECT
                 Log.i(TAG, "Backend detected: SYSFS_DIRECT")
             }
+            lastWriteTime = System.currentTimeMillis()
             Log.d(TAG, "sysfs direct OK -> $command")
             true
         } catch (t: Throwable) {
@@ -98,6 +116,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     detectedBackend = LedBackend.SYSFS_SU
                     Log.i(TAG, "Backend detected: SYSFS_SU")
                 }
+                lastWriteTime = System.currentTimeMillis()
                 Log.d(TAG, "sysfs su OK -> $command")
                 true
             } else {
@@ -113,28 +132,42 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     /* -------------------- Orchestrator -------------------- */
 
     /**
-     * Sysfs komutu oluştur ve 3 katmanlı fallback ile çalıştır.
-     * @param jniBlock JNI ile çalıştırılacak blok (null ise JNI atlanır)
-     * @param sysfsCommand Sysfs'e yazılacak komut (örn: "w 0x66FF0000")
+     * LED'e renk komutu gönderir. Senkronize + cooldown + deduplicate.
      */
     private fun writeLed(jniBlock: (() -> Unit)?, sysfsCommand: String) {
-        // 1) su 0 ile sysfs (B3PNR 10" için)
-        if (detectedBackend == LedBackend.UNKNOWN || detectedBackend == LedBackend.SYSFS_SU) {
-            // Renk kalıntısını önlemek için önce LED'i kapat
-            trySysfsSu("w 0x02")
-            if (trySysfsSu(sysfsCommand)) return
+        synchronized(ledLock) {
+            // Aynı komut 2 kez peş peşe gelmişse atla (debounce)
+            if (sysfsCommand == lastSysfsCommand) {
+                val elapsed = System.currentTimeMillis() - lastWriteTime
+                if (elapsed < 200) {
+                    Log.d(TAG, "Debounce: skipping duplicate '$sysfsCommand' (${elapsed}ms ago)")
+                    return
+                }
+            }
+
+            // Cooldown: LED kontrolcünün hazır olmasını bekle
+            waitForCooldown()
+
+            // 1) su 0 ile sysfs (B3PNR 10" için)
+            if (trySysfsSu(sysfsCommand)) {
+                lastSysfsCommand = sysfsCommand
+                return
+            }
+
+            // 2) FileOutputStream ile doğrudan sysfs
+            if (trySysfsDirect(sysfsCommand)) {
+                lastSysfsCommand = sysfsCommand
+                return
+            }
+
+            // 3) JNI (B1PNR / B3PNR 16" için)
+            if (jniBlock != null && tryJni(jniBlock)) {
+                lastSysfsCommand = sysfsCommand
+                return
+            }
+
+            Log.e(TAG, "All backends failed for command: $sysfsCommand")
         }
-
-        // 2) FileOutputStream ile doğrudan sysfs
-        if (detectedBackend == LedBackend.UNKNOWN || detectedBackend == LedBackend.SYSFS_DIRECT) {
-            trySysfsDirect("w 0x02")
-            if (trySysfsDirect(sysfsCommand)) return
-        }
-
-        // 3) JNI (B1PNR / B3PNR 16" için)
-        if (jniBlock != null && tryJni(jniBlock)) return
-
-        Log.e(TAG, "All backends failed for command: $sysfsCommand")
     }
 
     /** RGB değerlerinden (0-100 ölçeği) sysfs komutu oluştur */
