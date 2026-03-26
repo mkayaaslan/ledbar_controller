@@ -14,7 +14,6 @@ class MethodChannelLedbarController extends LedbarControllerPlatform {
 
   @override
   Future<String?> getPlatformVersion() async {
-    // İstersen Android tarafına özel bir method ekleyip döndürebilirsin
     return null;
   }
 
@@ -30,10 +29,11 @@ class MethodChannelLedbarController extends LedbarControllerPlatform {
       'color': color,
       'side': side.name,
       'brightness': brightness,
-      'hardReset': hardReset,   // 👈 eklendi
-      'rawScale': rawScale,     // 👈 eklendi
+      'hardReset': hardReset,
+      'rawScale': rawScale,
     });
   }
+
 
 
   @override

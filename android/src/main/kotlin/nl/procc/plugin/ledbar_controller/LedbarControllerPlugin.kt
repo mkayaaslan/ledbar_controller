@@ -5,14 +5,26 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import com.example.elcapi.jnielc
-import java.io.FileOutputStream  // 👈 gerekli
+import java.io.FileOutputStream
 
 class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private lateinit var channel: MethodChannel
 
+    /* -------------------- Backend Detection -------------------- */
+
+    private enum class LedBackend { JNI, SYSFS_DIRECT, SYSFS_SU, UNKNOWN }
+
+    /** İlk başarılı çağrıda tespit edilen backend; sonraki çağrılarda cache'den okunur. */
+    private var detectedBackend: LedBackend = LedBackend.UNKNOWN
+
+    companion object {
+        private const val TAG = "LED_PLUGIN"
+        private const val SYSFS_PATH = "/sys/devices/platform/led_con_h/zigbee_reset"
+    }
+
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        Log.i("LED_PLUGIN", "onAttachedToEngine() called")
+        Log.i(TAG, "onAttachedToEngine() called")
         channel = MethodChannel(binding.binaryMessenger, "procc/ledbar")
         channel.setMethodCallHandler(this)
     }
@@ -21,28 +33,103 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         channel.setMethodCallHandler(null)
     }
 
-    /* -------------------- Helpers (minimal) -------------------- */
+    /* -------------------- Helpers -------------------- */
 
     private fun to015(rawScale: Boolean, v: Int): Int =
         if (rawScale) v.coerceIn(0, 15) else (v.coerceIn(0, 100) * 15 / 100).coerceIn(0, 15)
 
-    /** Sysfs fallback: doğrudan dosyaya yaz (newline şart) */
-    private fun writeSysfsColor(r255: Int, g255: Int, b255: Int) {
-        val rr = r255.coerceIn(0, 255)
-        val gg = g255.coerceIn(0, 255)
-        val bb = b255.coerceIn(0, 255)
-        val line = String.format("w 0x66%02x%02x%02x\n", rr, gg, bb) // \n önemli
-        val path = "/sys/devices/platform/led_con_h/zigbee_reset"
-        try {
-            FileOutputStream(path).use { fos ->
-                fos.write(line.toByteArray(Charsets.US_ASCII))
-                fos.flush()
+    /* -------------------- Backend: JNI -------------------- */
+
+    private fun tryJni(block: () -> Unit): Boolean {
+        if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.JNI) return false
+        return try {
+            block()
+            if (detectedBackend == LedBackend.UNKNOWN) {
+                detectedBackend = LedBackend.JNI
+                Log.i(TAG, "Backend detected: JNI")
             }
-            Log.i("LED_PLUGIN", "sysfs write OK -> $line")
+            true
         } catch (t: Throwable) {
-            Log.e("LED_PLUGIN", "sysfs write FAIL -> $line at $path", t)
+            Log.w(TAG, "JNI failed: ${t.message}")
+            false
         }
     }
+
+    /* -------------------- Backend: Sysfs Direct (FileOutputStream) -------------------- */
+
+    private fun trySysfsDirect(command: String): Boolean {
+        if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.SYSFS_DIRECT) return false
+        return try {
+            FileOutputStream(SYSFS_PATH).use { fos ->
+                fos.write("$command\n".toByteArray(Charsets.US_ASCII))
+                fos.flush()
+            }
+            if (detectedBackend == LedBackend.UNKNOWN) {
+                detectedBackend = LedBackend.SYSFS_DIRECT
+                Log.i(TAG, "Backend detected: SYSFS_DIRECT")
+            }
+            Log.d(TAG, "sysfs direct OK -> $command")
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "sysfs direct failed: ${t.message}")
+            false
+        }
+    }
+
+    /* -------------------- Backend: Sysfs via su 0 (root shell) -------------------- */
+
+    private fun trySysfsSu(command: String): Boolean {
+        if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.SYSFS_SU) return false
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "0", "sh", "-c",
+                "echo $command > $SYSFS_PATH"))
+            val exitCode = process.waitFor()
+            if (exitCode == 0) {
+                if (detectedBackend == LedBackend.UNKNOWN) {
+                    detectedBackend = LedBackend.SYSFS_SU
+                    Log.i(TAG, "Backend detected: SYSFS_SU")
+                }
+                Log.d(TAG, "sysfs su OK -> $command")
+                true
+            } else {
+                Log.w(TAG, "sysfs su exit=$exitCode for: $command")
+                false
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "sysfs su failed: ${t.message}")
+            false
+        }
+    }
+
+    /* -------------------- Orchestrator -------------------- */
+
+    /**
+     * Sysfs komutu oluştur ve 3 katmanlı fallback ile çalıştır.
+     * @param jniBlock JNI ile çalıştırılacak blok (null ise JNI atlanır)
+     * @param sysfsCommand Sysfs'e yazılacak komut (örn: "w 0x66FF0000")
+     */
+    private fun writeLed(jniBlock: (() -> Unit)?, sysfsCommand: String) {
+        // 1) JNI
+        if (jniBlock != null && tryJni(jniBlock)) return
+
+        // 2) FileOutputStream (doğrudan yazma)
+        if (trySysfsDirect(sysfsCommand)) return
+
+        // 3) su 0 (root shell)
+        if (trySysfsSu(sysfsCommand)) return
+
+        Log.e(TAG, "All backends failed for command: $sysfsCommand")
+    }
+
+    /** RGB değerlerinden (0-100 ölçeği) sysfs komutu oluştur */
+    private fun rgbToSysfsCommand(r100: Int, g100: Int, b100: Int): String {
+        val r255 = (r100.coerceIn(0, 100) * 255) / 100
+        val g255 = (g100.coerceIn(0, 100) * 255) / 100
+        val b255 = (b100.coerceIn(0, 100) * 255) / 100
+        return String.format("w 0x66%02x%02x%02x", r255, g255, b255)
+    }
+
+    /* -------------------- MethodChannel Handler -------------------- */
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
@@ -53,14 +140,14 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
 
                 "off" -> {
-                    try {
-                        jnielc.seekstart()
-                        jnielc.ledoff()
-                        jnielc.seekstop()
-                    } catch (t: Throwable) {
-                        Log.w("LED_PLUGIN", "JNI off failed, fallback to sysfs", t)
-                    }
-                    writeSysfsColor(0, 0, 0)
+                    writeLed(
+                        jniBlock = {
+                            jnielc.seekstart()
+                            jnielc.ledoff()
+                            jnielc.seekstop()
+                        },
+                        sysfsCommand = "w 0x02"
+                    )
                     result.success(null)
                 }
 
@@ -69,26 +156,25 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     val inBright = (call.argument<Int>("brightness") ?: 50).coerceIn(0, 100)
                     val v015 = to015(false, inBright)
 
-                    // 1) JNI dene
-                    try {
-                        jnielc.seekstart()
-                        jnielc.ledseek(flag, v015)
-                        jnielc.seekstop()
-                    } catch (t: Throwable) {
-                        Log.w("LED_PLUGIN", "JNI rawSeek failed, fallback to sysfs", t)
+                    val (r100, g100, b100) = when (flag) {
+                        0xA1, 0xB1 -> Triple(inBright, 0, 0)       // red
+                        0xA2, 0xB2 -> Triple(0, inBright, 0)       // green
+                        else       -> Triple(0, 0, inBright)       // blue
                     }
-                    // 2) sysfs fallback (flag'a göre yaklaşık RGB)
-                    val (r100,g100,b100) = when (flag) {
-                        0xA1, 0xB1 -> Triple(inBright, 0, 0)     // red
-                        0xA2, 0xB2 -> Triple(0, inBright, 0)     // green
-                        else      -> Triple(0, 0, inBright)      // blue
-                    }
-                    writeSysfsColor((r100*255)/100, (g100*255)/100, (b100*255)/100)
+
+                    writeLed(
+                        jniBlock = {
+                            jnielc.seekstart()
+                            jnielc.ledseek(flag, v015)
+                            jnielc.seekstop()
+                        },
+                        sysfsCommand = rgbToSysfsCommand(r100, g100, b100)
+                    )
                     result.success(null)
                 }
 
                 "setRgb" -> {
-                    val side     = (call.argument<String>("side") ?: "right").lowercase() // right|left|both
+                    val side     = (call.argument<String>("side") ?: "right").lowercase()
                     val rawScale = call.argument<Boolean>("rawScale") ?: false
                     val inR      = call.argument<Int>("r") ?: 0
                     val inG      = call.argument<Int>("g") ?: 0
@@ -98,40 +184,31 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     val G015 = to015(rawScale, inG)
                     val B015 = to015(rawScale, inB)
 
-                    // 1) JNI dene
-                    try {
-                        jnielc.seekstart()
-                        if (side == "right" || side == "both") {
-                            jnielc.ledseek(0xA1, R015)
-                            jnielc.ledseek(0xA2, G015)
-                            jnielc.ledseek(0xA3, B015)
-                        }
-                        if (side == "left" || side == "both") {
-                            // sol: mono-red
-                            jnielc.ledseek(0xB1, R015)
-                        }
-                        jnielc.seekstop()
-                    } catch (t: Throwable) {
-                        Log.w("LED_PLUGIN", "JNI setRgb failed, fallback to sysfs", t)
-                    }
-
-                    // 2) sysfs fallback (tek atışta RGB)
-                    writeSysfsColor(
-                        (inR.coerceIn(0, 100) * 255) / 100,
-                        (inG.coerceIn(0, 100) * 255) / 100,
-                        (inB.coerceIn(0, 100) * 255) / 100
+                    writeLed(
+                        jniBlock = {
+                            jnielc.seekstart()
+                            if (side == "right" || side == "both") {
+                                jnielc.ledseek(0xA1, R015)
+                                jnielc.ledseek(0xA2, G015)
+                                jnielc.ledseek(0xA3, B015)
+                            }
+                            if (side == "left" || side == "both") {
+                                jnielc.ledseek(0xB1, R015)
+                            }
+                            jnielc.seekstop()
+                        },
+                        sysfsCommand = rgbToSysfsCommand(inR, inG, inB)
                     )
                     result.success(null)
                 }
 
                 "setColor" -> {
-                    // Geriye dönük uyumluluk: primary + kombineleri setRgb'e map’ler
-                    val color = (call.argument<String>("color") ?: "blue").lowercase()
-                    val side  = (call.argument<String>("side")  ?: "right").lowercase()
-                    val bright = (call.argument<Int>("brightness") ?: 50).coerceIn(0,100)
+                    val color  = (call.argument<String>("color") ?: "blue").lowercase()
+                    val side   = (call.argument<String>("side") ?: "right").lowercase()
+                    val bright = (call.argument<Int>("brightness") ?: 50).coerceIn(0, 100)
 
-                    val (r,g,b) = when (color) {
-                        "red"     -> Triple(bright, 0, bright - bright)   // (bright,0,0)
+                    val (r, g, b) = when (color) {
+                        "red"     -> Triple(bright, 0, 0)
                         "green"   -> Triple(0, bright, 0)
                         "blue"    -> Triple(0, 0, bright)
                         "yellow"  -> Triple(bright, bright, 0)
@@ -141,31 +218,28 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                         else      -> Triple(0, 0, bright)
                     }
 
-                    // JNI dene
-                    try {
-                        jnielc.seekstart()
-                        if (side == "right" || side == "both") {
-                            jnielc.ledseek(0xA1, to015(false, r))
-                            jnielc.ledseek(0xA2, to015(false, g))
-                            jnielc.ledseek(0xA3, to015(false, b))
-                        }
-                        if (side == "left" || side == "both") {
-                            jnielc.ledseek(0xB1, to015(false, r)) // sol: sadece kırmızı
-                        }
-                        jnielc.seekstop()
-                    } catch (t: Throwable) {
-                        Log.w("LED_PLUGIN", "JNI setColor failed, fallback to sysfs", t)
-                    }
-
-                    // sysfs fallback
-                    writeSysfsColor((r*255)/100, (g*255)/100, (b*255)/100)
+                    writeLed(
+                        jniBlock = {
+                            jnielc.seekstart()
+                            if (side == "right" || side == "both") {
+                                jnielc.ledseek(0xA1, to015(false, r))
+                                jnielc.ledseek(0xA2, to015(false, g))
+                                jnielc.ledseek(0xA3, to015(false, b))
+                            }
+                            if (side == "left" || side == "both") {
+                                jnielc.ledseek(0xB1, to015(false, r))
+                            }
+                            jnielc.seekstop()
+                        },
+                        sysfsCommand = rgbToSysfsCommand(r, g, b)
+                    )
                     result.success(null)
                 }
 
                 else -> result.notImplemented()
             }
         } catch (t: Throwable) {
-            Log.e("LED_PLUGIN", "onMethodCall error", t)
+            Log.e(TAG, "onMethodCall error", t)
             result.error("LED_ERROR", t.message, null)
         }
     }
