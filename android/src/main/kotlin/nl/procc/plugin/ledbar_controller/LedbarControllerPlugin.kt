@@ -7,6 +7,18 @@ import io.flutter.plugin.common.MethodChannel
 import com.example.elcapi.jnielc
 import java.io.FileOutputStream
 
+/**
+ * Flutter plugin for controlling the LED bar on iiyama industrial Android tablets.
+ *
+ * Supports three backends with automatic detection and fallback:
+ *   1. SYSFS_SU   - Root shell sysfs write (B3PNR 10")
+ *   2. SYSFS_DIRECT - Direct FileOutputStream sysfs write
+ *   3. JNI        - Native libjnielc.so via /dev/ledjni (B1PNR, B3PNR 16")
+ *
+ * The first successful backend is cached for subsequent calls.
+ *
+ * MethodChannel: 'procc/ledbar'
+ */
 class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private lateinit var channel: MethodChannel
@@ -15,19 +27,19 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     private enum class LedBackend { JNI, SYSFS_DIRECT, SYSFS_SU, UNKNOWN }
 
-    /** İlk başarılı çağrıda tespit edilen backend; sonraki çağrılarda cache'den okunur. */
+    /** Detected backend; cached after the first successful call. */
     private var detectedBackend: LedBackend = LedBackend.UNKNOWN
 
-    /** Son gönderilen sysfs komutu — aynı komutu tekrar göndermemek için */
+    /** Last sysfs command sent — used for debounce deduplication. */
     private var lastSysfsCommand: String? = null
 
-    /** Son LED yazma zamanı (ms) */
+    /** Timestamp of the last LED write (ms). */
     private var lastWriteTime: Long = 0L
 
-    /** LED komutları arası minimum bekleme süresi (ms) */
+    /** Minimum delay between LED writes (ms) to prevent controller race conditions. */
     private val LED_COOLDOWN_MS = 80L
 
-    /** Eş zamanlı LED erişimini önlemek için kilit */
+    /** Lock to prevent concurrent LED access. */
     private val ledLock = Object()
 
     companion object {
@@ -47,10 +59,15 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /* -------------------- Helpers -------------------- */
 
+    /**
+     * Converts a value to the 0-15 hardware scale.
+     * If [rawScale] is true, the value is already in 0-15; just clamp it.
+     * Otherwise, convert from 0-100 percentage to 0-15.
+     */
     private fun to015(rawScale: Boolean, v: Int): Int =
         if (rawScale) v.coerceIn(0, 15) else (v.coerceIn(0, 100) * 15 / 100).coerceIn(0, 15)
 
-    /** LED kontrolcünün hazır olmasını bekle */
+    /** Waits until the LED controller cooldown period has elapsed. */
     private fun waitForCooldown() {
         val elapsed = System.currentTimeMillis() - lastWriteTime
         if (elapsed < LED_COOLDOWN_MS) {
@@ -60,11 +77,16 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /* -------------------- Backend: JNI -------------------- */
 
+    /**
+     * Calls jnielc.seekstart() and throws if it returns a negative value (fp=-1),
+     * indicating that /dev/ledjni could not be opened.
+     */
     private fun jniSeekStartOrThrow() {
         val fp = jnielc.seekstart()
         if (fp < 0) throw RuntimeException("JNI seekstart failed: fp=$fp")
     }
 
+    /** Attempts to execute the JNI block. Returns true on success. */
     private fun tryJni(block: () -> Unit): Boolean {
         if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.JNI) return false
         return try {
@@ -83,6 +105,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /* -------------------- Backend: Sysfs Direct (FileOutputStream) -------------------- */
 
+    /** Attempts to write the command directly to the sysfs file. Returns true on success. */
     private fun trySysfsDirect(command: String): Boolean {
         if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.SYSFS_DIRECT) return false
         return try {
@@ -105,6 +128,11 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /* -------------------- Backend: Sysfs via su 0 (root shell) -------------------- */
 
+    /**
+     * Attempts to write the command to sysfs via a root shell (su 0).
+     * Required for B3PNR 10" where the sysfs file is owned by root.
+     * Returns true on success.
+     */
     private fun trySysfsSu(command: String): Boolean {
         if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.SYSFS_SU) return false
         return try {
@@ -132,11 +160,19 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     /* -------------------- Orchestrator -------------------- */
 
     /**
-     * LED'e renk komutu gönderir. Senkronize + cooldown + deduplicate.
+     * Sends a color command to the LED bar using the best available backend.
+     *
+     * Features:
+     * - Synchronized: prevents concurrent LED access
+     * - Debounce: skips duplicate commands within 200ms
+     * - Cooldown: waits 80ms between writes for the LED controller to settle
+     *
+     * @param jniBlock JNI call block (null to skip JNI)
+     * @param sysfsCommand Sysfs command string (e.g. "w 0x66FF0000")
      */
     private fun writeLed(jniBlock: (() -> Unit)?, sysfsCommand: String) {
         synchronized(ledLock) {
-            // Aynı komut 2 kez peş peşe gelmişse atla (debounce)
+            // Debounce: skip duplicate commands within 200ms
             if (sysfsCommand == lastSysfsCommand) {
                 val elapsed = System.currentTimeMillis() - lastWriteTime
                 if (elapsed < 200) {
@@ -145,22 +181,22 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
             }
 
-            // Cooldown: LED kontrolcünün hazır olmasını bekle
+            // Cooldown: wait for the LED controller to be ready
             waitForCooldown()
 
-            // 1) su 0 ile sysfs (B3PNR 10" için)
+            // 1) Sysfs via su 0 (B3PNR 10")
             if (trySysfsSu(sysfsCommand)) {
                 lastSysfsCommand = sysfsCommand
                 return
             }
 
-            // 2) FileOutputStream ile doğrudan sysfs
+            // 2) Sysfs via direct FileOutputStream
             if (trySysfsDirect(sysfsCommand)) {
                 lastSysfsCommand = sysfsCommand
                 return
             }
 
-            // 3) JNI (B1PNR / B3PNR 16" için)
+            // 3) JNI via libjnielc.so (B1PNR / B3PNR 16")
             if (jniBlock != null && tryJni(jniBlock)) {
                 lastSysfsCommand = sysfsCommand
                 return
@@ -170,7 +206,10 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
     }
 
-    /** RGB değerlerinden (0-100 ölçeği) sysfs komutu oluştur */
+    /**
+     * Converts RGB values (0-100 scale) to a sysfs command string.
+     * Format: "w 0x66RRGGBB" where RR/GG/BB are hex values 0-255.
+     */
     private fun rgbToSysfsCommand(r100: Int, g100: Int, b100: Int): String {
         val r255 = (r100.coerceIn(0, 100) * 255) / 100
         val g255 = (g100.coerceIn(0, 100) * 255) / 100
@@ -205,10 +244,11 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     val inBright = (call.argument<Int>("brightness") ?: 50).coerceIn(0, 100)
                     val v015 = to015(false, inBright)
 
+                    // Map JNI flags to approximate RGB for sysfs fallback
                     val (r100, g100, b100) = when (flag) {
-                        0xA1, 0xB1 -> Triple(inBright, 0, 0)       // red
-                        0xA2, 0xB2 -> Triple(0, inBright, 0)       // green
-                        else       -> Triple(0, 0, inBright)       // blue
+                        0xA1, 0xB1 -> Triple(inBright, 0, 0)       // red channel
+                        0xA2, 0xB2 -> Triple(0, inBright, 0)       // green channel
+                        else       -> Triple(0, 0, inBright)       // blue channel
                     }
 
                     writeLed(
@@ -236,11 +276,13 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     writeLed(
                         jniBlock = {
                             jniSeekStartOrThrow()
+                            // Right side: independent R/G/B channels
                             if (side == "right" || side == "both") {
-                                jnielc.ledseek(0xA1, R015)
-                                jnielc.ledseek(0xA2, G015)
-                                jnielc.ledseek(0xA3, B015)
+                                jnielc.ledseek(0xA1, R015)  // right red
+                                jnielc.ledseek(0xA2, G015)  // right green
+                                jnielc.ledseek(0xA3, B015)  // right blue
                             }
+                            // Left side: mono red only
                             if (side == "left" || side == "both") {
                                 jnielc.ledseek(0xB1, R015)
                             }
@@ -256,6 +298,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     val side   = (call.argument<String>("side") ?: "right").lowercase()
                     val bright = (call.argument<Int>("brightness") ?: 50).coerceIn(0, 100)
 
+                    // Map color names to RGB values (0-100 scale)
                     val (r, g, b) = when (color) {
                         "red"     -> Triple(bright, 0, 0)
                         "green"   -> Triple(0, bright, 0)
