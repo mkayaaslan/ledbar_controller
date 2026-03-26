@@ -21,7 +21,7 @@ enum ColorEnum {
       case ColorEnum.white:
         return {'r': 100, 'g': 100, 'b': 100};
       case ColorEnum.dimWhite:
-        return {'r': 20, 'g': 20, 'b': 20};
+        return {'r': 40, 'g': 40, 'b': 40};
     }
   }
 }
