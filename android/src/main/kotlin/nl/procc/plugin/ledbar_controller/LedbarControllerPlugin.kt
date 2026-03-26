@@ -119,10 +119,17 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
      */
     private fun writeLed(jniBlock: (() -> Unit)?, sysfsCommand: String) {
         // 1) su 0 ile sysfs (B3PNR 10" için)
-        if (trySysfsSu(sysfsCommand)) return
+        if (detectedBackend == LedBackend.UNKNOWN || detectedBackend == LedBackend.SYSFS_SU) {
+            // Renk kalıntısını önlemek için önce LED'i kapat
+            trySysfsSu("w 0x02")
+            if (trySysfsSu(sysfsCommand)) return
+        }
 
         // 2) FileOutputStream ile doğrudan sysfs
-        if (trySysfsDirect(sysfsCommand)) return
+        if (detectedBackend == LedBackend.UNKNOWN || detectedBackend == LedBackend.SYSFS_DIRECT) {
+            trySysfsDirect("w 0x02")
+            if (trySysfsDirect(sysfsCommand)) return
+        }
 
         // 3) JNI (B1PNR / B3PNR 16" için)
         if (jniBlock != null && tryJni(jniBlock)) return
