@@ -4,17 +4,20 @@ import 'package:flutter/services.dart';
 import 'ledbar_controller.dart';
 import 'ledbar_controller_platform_interface.dart';
 
+/// Android MethodChannel implementation of [LedbarControllerPlatform].
+///
+/// Communicates with the native Kotlin plugin via the 'procc/ledbar' channel.
 class MethodChannelLedbarController extends LedbarControllerPlatform {
   @visibleForTesting
   final methodChannel = const MethodChannel('procc/ledbar');
 
+  /// Ping the native plugin to verify connectivity.
   Future<String?> ping() async {
     return await methodChannel.invokeMethod<String>('ping');
   }
 
   @override
   Future<String?> getPlatformVersion() async {
-    // İstersen Android tarafına özel bir method ekleyip döndürebilirsin
     return null;
   }
 
@@ -30,11 +33,10 @@ class MethodChannelLedbarController extends LedbarControllerPlatform {
       'color': color,
       'side': side.name,
       'brightness': brightness,
-      'hardReset': hardReset,   // 👈 eklendi
-      'rawScale': rawScale,     // 👈 eklendi
+      'hardReset': hardReset,
+      'rawScale': rawScale,
     });
   }
-
 
   @override
   Future<void> setRgb({
@@ -55,8 +57,7 @@ class MethodChannelLedbarController extends LedbarControllerPlatform {
 
   @override
   Future<void> rawSeek(int flag, {int brightness = 80}) async {
-    const ch = MethodChannel('procc/ledbar');
-    await ch.invokeMethod('rawSeek', {
+    return methodChannel.invokeMethod('rawSeek', {
       'flag': flag,
       'brightness': brightness, // 0..100
     });
