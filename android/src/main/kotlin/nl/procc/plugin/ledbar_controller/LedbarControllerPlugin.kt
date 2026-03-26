@@ -40,6 +40,15 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     /* -------------------- Backend: JNI -------------------- */
 
+    /**
+     * seekstart() dönüş değerini kontrol eder.
+     * fp=-1 dönerse JNI kullanılamaz (exception fırlatmaz, sadece log yazar).
+     */
+    private fun jniSeekStartOrThrow() {
+        val fp = jnielc.seekstart()
+        if (fp < 0) throw RuntimeException("JNI seekstart failed: fp=$fp")
+    }
+
     private fun tryJni(block: () -> Unit): Boolean {
         if (detectedBackend != LedBackend.UNKNOWN && detectedBackend != LedBackend.JNI) return false
         return try {
@@ -142,7 +151,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 "off" -> {
                     writeLed(
                         jniBlock = {
-                            jnielc.seekstart()
+                            jniSeekStartOrThrow()
                             jnielc.ledoff()
                             jnielc.seekstop()
                         },
@@ -164,7 +173,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
                     writeLed(
                         jniBlock = {
-                            jnielc.seekstart()
+                            jniSeekStartOrThrow()
                             jnielc.ledseek(flag, v015)
                             jnielc.seekstop()
                         },
@@ -186,7 +195,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
                     writeLed(
                         jniBlock = {
-                            jnielc.seekstart()
+                            jniSeekStartOrThrow()
                             if (side == "right" || side == "both") {
                                 jnielc.ledseek(0xA1, R015)
                                 jnielc.ledseek(0xA2, G015)
@@ -220,7 +229,7 @@ class LedbarControllerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
                     writeLed(
                         jniBlock = {
-                            jnielc.seekstart()
+                            jniSeekStartOrThrow()
                             if (side == "right" || side == "both") {
                                 jnielc.ledseek(0xA1, to015(false, r))
                                 jnielc.ledseek(0xA2, to015(false, g))
